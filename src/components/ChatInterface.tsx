@@ -8,6 +8,7 @@ import ChatInput from './ChatInput'
 export default function ChatInterface() {
   const { messages, input, handleInputChange, handleSubmit, isLoading } = useChat({
     api: '/api/chat',
+    initialMessages: [],
   })
 
   return (
@@ -17,7 +18,7 @@ export default function ChatInterface() {
       </div>
       <div className="border-t border-gray-200 dark:border-gray-700 p-4">
         <ChatInput
-          input={input}
+          input={input || ''}
           handleInputChange={handleInputChange}
           handleSubmit={handleSubmit}
           isLoading={isLoading}

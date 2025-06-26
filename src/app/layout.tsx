@@ -5,8 +5,8 @@ import './globals.css'
 const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
-  title: 'PTCC RAG Chatbot',
-  description: 'A RAG-powered chatbot built with Next.js',
+  title: 'Blue Phoenix Taekwondo Assistant',
+  description: 'AI assistant for Blue Phoenix Taekwondo student management and program information',
 }
 
 export default function RootLayout({

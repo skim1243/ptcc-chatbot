@@ -22,8 +22,10 @@ export default function MessageList({ messages }: MessageListProps) {
 
   return (
     <div className="space-y-4">
-      {messages.map((message) => (
-        <MessageItem key={message.id} message={message} />
+      {messages.map((message, index) => (
+        <div key={message.id} className="message-item">
+          <MessageItem message={message} />
+        </div>
       ))}
     </div>
   )
