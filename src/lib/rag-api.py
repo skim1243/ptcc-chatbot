@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 from flask import Flask, request, jsonify
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -5,6 +7,17 @@ from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 import os
 import logging
+import datetime
+
+log_file_path = os.path.join(os.path.dirname(__file__), 'rag-log.txt')
+
+current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+log_message = f"Log entry at {current_time}: Script ran successfully.\n"
+
+with open(log_file_path, 'a') as f:
+    f.write(log_message)
+
+print(f"Successfully wrote to {log_file_path}")
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
