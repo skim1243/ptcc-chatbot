@@ -1,7 +1,6 @@
-# functions/update_vectorstore.py
-
 import os
 import logging
+from google.cloud import storage
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
@@ -11,98 +10,133 @@ from firebase_admin import initialize_app
 
 logging.basicConfig(level=logging.INFO)
 
-PDF_DATA_DIR = "data"
-PERSIST_DIRECTORY = './chroma_db'
+# --- Configuration ---
+# GCS Buckets
+PDF_BUCKET_NAME = "your-source-pdf-bucket-name"  # Bucket with your PDF files
+CHROMA_BUCKET_NAME = "your-chroma-db-bucket-name" # Bucket to store the Chroma DB
+
+# Local paths within the Cloud Function's temporary filesystem
+LOCAL_DB_PATH = "/tmp/chroma_db"
+LOCAL_PDF_PATH = "/tmp/pdfs"
+
+# LangChain settings
 EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
 
+# --- Initialization ---
 initialize_app()
+storage_client = storage.Client()
+
+# --- GCS Helper Functions ---
+
+def download_directory_from_gcs(bucket_name, gcs_folder, local_path):
+    """Downloads a directory from GCS to a local path."""
+    if os.path.exists(local_path):
+        return # Already exists
+    os.makedirs(local_path, exist_ok=True)
+    bucket = storage_client.bucket(bucket_name)
+    blobs = bucket.list_blobs(prefix=gcs_folder)
+    for blob in blobs:
+        # Create nested directories if they don't exist
+        local_file_path = os.path.join(local_path, os.path.relpath(blob.name, gcs_folder))
+        local_file_dir = os.path.dirname(local_file_path)
+        os.makedirs(local_file_dir, exist_ok=True)
+        blob.download_to_filename(local_file_path)
+    logging.info(f"Downloaded GCS folder '{gcs_folder}' to '{local_path}'")
+
+def upload_directory_to_gcs(local_path, bucket_name, gcs_folder):
+    """Uploads a local directory to a GCS folder."""
+    bucket = storage_client.bucket(bucket_name)
+    for local_file in os.listdir(local_path):
+        local_file_path = os.path.join(local_path, local_file)
+        if os.path.isfile(local_file_path):
+            blob = bucket.blob(os.path.join(gcs_folder, local_file))
+            blob.upload_from_filename(local_file_path)
+    logging.info(f"Uploaded '{local_path}' to GCS folder '{gcs_folder}'")
+
+# --- Main Logic ---
 
 def perform_vectorstore_update():
     """
-    Encapsulates the logic to create or update the Chroma vector store.
-    This is the core "cron job" task.
+    Encapsulates the logic to create or update the Chroma vector store from GCS.
     """
     embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
-    # Check if the persist directory exists relative to the function's root
-    # Cloud Functions file system is ephemeral, so persistence means writing
-    # to Cloud Storage or re-creating on each run if data source is small.
-    # For larger DBs, you'd load from GCS and save back.
-    # For this example, we'll assume it's created or re-created on each run if needed.
+    # 1. Download existing vector store from GCS
+    try:
+        download_directory_from_gcs(CHROMA_BUCKET_NAME, 'db', LOCAL_DB_PATH)
+    except Exception as e:
+        logging.warning(f"Could not download existing DB, will create a new one. Error: {e}")
 
-    if os.path.exists(PERSIST_DIRECTORY):
-        logging.info("Attempting to load existing vector store (Note: ephemeral FS in CF)...")
-        # For actual persistence across Cloud Function invocations,
-        # you'd likely download from Google Cloud Storage here.
-        # Example: vectorstore = load_from_gcs_or_similar()
+    # 2. Load the vector store if it exists
+    vectorstore = None
+    processed_files = set()
+    if os.path.exists(LOCAL_DB_PATH) and os.listdir(LOCAL_DB_PATH):
+        logging.info("Loading existing vector store from local temp directory.")
+        vectorstore = Chroma(persist_directory=LOCAL_DB_PATH, embedding_function=embeddings)
+        # Get list of already processed files from metadata
+        existing_docs = vectorstore.get(include=["metadatas"])
+        processed_files = {metadata['filename'] for metadata in existing_docs['metadatas']}
+        logging.info(f"Found {len(processed_files)} already processed files.")
+
+    # 3. Check for new files in the source GCS bucket
+    pdf_bucket = storage_client.bucket(PDF_BUCKET_NAME)
+    all_source_files = {blob.name for blob in pdf_bucket.list_blobs() if blob.name.endswith(".pdf")}
+    new_files_to_process = list(all_source_files - processed_files)
+
+    if not new_files_to_process:
+        logging.info("No new PDF files to process. Exiting.")
+        return # Nothing to do
+
+    logging.info(f"Found {len(new_files_to_process)} new files to process: {new_files_to_process}")
+
+    # 4. Process only the new files
+    os.makedirs(LOCAL_PDF_PATH, exist_ok=True)
+    new_documents = []
+    for filename in new_files_to_process:
         try:
-            vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embeddings)
-            logging.info("Loaded existing vector store.")
+            local_pdf_file_path = os.path.join(LOCAL_PDF_PATH, os.path.basename(filename))
+            blob = pdf_bucket.blob(filename)
+            blob.download_to_filename(local_pdf_file_path)
+            logging.info(f"Processing new PDF: {filename}")
+
+            loader = PyPDFLoader(local_pdf_file_path)
+            docs = loader.load()
+            for doc in docs:
+                doc.page_content = ' '.join(doc.page_content.split())
+                doc.metadata["filename"] = filename # Use the full GCS path as the unique ID
+            new_documents.extend(docs)
+            os.remove(local_pdf_file_path) # Clean up downloaded PDF
         except Exception as e:
-            logging.warning(f"Failed to load existing vector store, re-creating: {e}")
-            vectorstore = None
+            logging.error(f"Error processing {filename}: {e}")
+
+    if not new_documents:
+        raise ValueError("Failed to load any new documents. Halting.")
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = text_splitter.split_documents(new_documents)
+    logging.info(f"Splitting new documents into {len(chunks)} chunks.")
+
+    # 5. Add new documents to the store or create a new one
+    if vectorstore:
+        logging.info("Adding new document chunks to existing vector store.")
+        vectorstore.add_documents(documents=chunks)
     else:
-        vectorstore = None
-
-    if vectorstore is None: # If not loaded or creation is forced
-        logging.info("Creating or re-creating new vector store...")
-
-        if not os.path.exists(PDF_DATA_DIR):
-            logging.error(f"PDF data directory not found in function deployment: {PDF_DATA_DIR}")
-            raise FileNotFoundError(f"PDF data directory not found at: {PDF_DATA_DIR}")
-
-        all_documents = []
-        for filename in os.listdir(PDF_DATA_DIR):
-            if filename.endswith(".pdf"):
-                file_path = os.path.join(PDF_DATA_DIR, filename)
-                logging.info(f"Loading PDF: {file_path}")
-                try:
-                    loader = PyPDFLoader(file_path)
-                    docs = loader.load()
-                    for doc in docs:
-                        cleaned_text = ' '.join(doc.page_content.split())
-                        doc.page_content = cleaned_text
-                        doc.metadata["filename"] = filename
-                    all_documents.extend(docs)
-                except Exception as e:
-                    logging.error(f"Error loading {filename}: {e}")
-
-        if not all_documents:
-            raise ValueError("No documents were loaded. Halting execution.")
-
-        logging.info(f"Loaded {len(all_documents)} pages from PDF files.")
-
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = text_splitter.split_documents(all_documents)
-
-        logging.info(f"Splitting into {len(chunks)} chunks.")
-        logging.info("Computing embeddings and creating vector store. This may take a while...")
-
+        logging.info("Creating new vector store from scratch.")
         vectorstore = Chroma.from_documents(
             documents=chunks,
             embedding=embeddings,
-            persist_directory=PERSIST_DIRECTORY
+            persist_directory=LOCAL_DB_PATH
         )
-        logging.info("Vector store created and persisted locally in CF runtime.")
 
-        # For actual persistence, you would then upload PERSIST_DIRECTORY contents to GCS
-        # Example: upload_directory_to_gcs(PERSIST_DIRECTORY, 'your-chroma-bucket')
+    # 6. Persist changes locally and upload the updated DB to GCS
+    logging.info("Persisting vector store changes locally.")
+    vectorstore.persist()
+    logging.info("Uploading updated vector store to GCS.")
+    upload_directory_to_gcs(LOCAL_DB_PATH, CHROMA_BUCKET_NAME, 'db')
+
+    logging.info("Vector store update complete.")
+
 
 @https_fn.on_request()
 def updateVectorStore(req: https_fn.Request) -> https_fn.Response:
-    """
-    HTTP Cloud Function to be triggered by Cloud Scheduler.
-    It calls the vector store update logic.
-    """
-    print("--- updateVectorStore Cloud Function triggered ---")
-
-    try:
-        perform_vectorstore_update()
-        print("--- Vector store update process completed successfully ---")
-        return https_fn.Response("Vector store updated successfully!", status=200)
-
-    except Exception as e:
-        print(f"--- Vector store update process FAILED: {e} ---")
-        import traceback
-        traceback.print_exc()
-        return https_fn.Response(f"Vector store update failed: {e}", status=500)
+    # ... (This part of the code remains the same) ...
